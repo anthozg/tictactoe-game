@@ -25,13 +25,29 @@ async function startServer() {
   const users = new Map<string, { 
     id: string, 
     username: string, 
-    email?: string, // Support for new email field
+    email?: string,
     hashedPassword: string, 
     status: 'online' | 'offline' | 'ingame', 
     socketId?: string, 
-    wins: number 
+    wins: number,
+    draws: number,
+    losses: number,
+    isBot?: boolean
   }>();
-  
+
+  // Initialize BOT player
+  const BOT_ID = 'bot-system';
+  users.set(BOT_ID, {
+    id: BOT_ID,
+    username: 'NEURAL-BOT',
+    hashedPassword: 'SYSTEM_BOT_ACCOUNT',
+    status: 'online',
+    wins: 99,
+    draws: 42,
+    losses: 12,
+    isBot: true
+  });
+
   const games = new Map<string, { 
     id: string, 
     players: string[], 
@@ -46,16 +62,56 @@ async function startServer() {
     seriesWinner?: string
   }>();
 
+  // Reconnection tracking
+  const reconnectionTimeouts = new Map<string, NodeJS.Timeout>();
+  const SERVER_START_TIME = Date.now();
+  let serverErrors = 0;
+
   // Requirement 9: Monitor and Log Server Events
   function logEvent(type: string, message: string, data?: any) {
     const timestamp = new Date().toISOString();
     const logEntry = `[${timestamp}] [${type.toUpperCase()}] ${message}`;
     console.log(logEntry, data ? JSON.stringify(data) : '');
-    // In a real production app, this would be written to a DB or log file.
+    if (type === 'error') serverErrors++;
   }
+
+  // Dashboard broadcaster
+  setInterval(() => {
+    const stats = {
+      connectedUsers: Array.from(users.values()).filter(u => u.status !== 'offline').length,
+      activeGames: Array.from(games.values()).filter(g => g.status === 'playing').length,
+      totalGames: games.size,
+      totalUsers: users.size - 1, // Exclude bot
+      errors: serverErrors,
+      uptimeSeconds: Math.floor((Date.now() - SERVER_START_TIME) / 1000)
+    };
+    io.emit('serverStats', stats);
+  }, 2000);
 
   io.on('connection', (socket) => {
     logEvent('system', `Socket connected: ${socket.id}`);
+
+    socket.on('rejoin', ({ userId }) => {
+      const user = users.get(userId);
+      if (user) {
+        user.socketId = socket.id;
+        user.status = user.status === 'offline' ? 'online' : user.status;
+        
+        // Clear any pending disconnect timeouts
+        if (reconnectionTimeouts.has(userId)) {
+          clearTimeout(reconnectionTimeouts.get(userId)!);
+          reconnectionTimeouts.delete(userId);
+          logEvent('system', `User reconnected: ${user.username}`);
+        }
+
+        // Send current game state if they are in one
+        const activeGame = Array.from(games.values()).find(g => g.players.includes(userId));
+        if (activeGame) {
+          socket.emit('gameStarted', activeGame);
+          broadcastUsers();
+        }
+      }
+    });
 
     socket.on('register', async ({ username, email, password }, callback) => {
       try {
@@ -75,7 +131,9 @@ async function startServer() {
           hashedPassword, 
           status: 'online', 
           socketId: socket.id, 
-          wins: 0 
+          wins: 0,
+          draws: 0,
+          losses: 0
         });
 
         logEvent('auth', `User registered: ${username} (${userId})`);
@@ -102,7 +160,7 @@ async function startServer() {
       try {
         const user = Array.from(users.values()).find(u => u.username === username);
         
-        if (user && await bcrypt.compare(password, user.hashedPassword)) {
+        if (user && user.id !== BOT_ID && await bcrypt.compare(password, user.hashedPassword)) {
           user.status = 'online';
           user.socketId = socket.id;
           logEvent('auth', `Login success: ${username}`);
@@ -119,45 +177,59 @@ async function startServer() {
     });
 
     socket.on('getUsers', () => {
-      socket.emit('userList', Array.from(users.values()).map(({ id, username, status, wins }) => ({ id, username, status, wins })));
+      socket.emit('userList', Array.from(users.values()).map(({ id, username, status, wins, draws, losses, isBot }) => ({ id, username, status, wins, draws, losses, isBot })));
     });
 
     socket.on('invite', ({ toUserId, fromUserId }) => {
       const toUser = users.get(toUserId);
       const fromUser = users.get(fromUserId);
+      
+      if (toUserId === BOT_ID && fromUser) {
+        // Auto-accept if bot
+        logEvent('game', `Player ${fromUser.username} challenging BOT`);
+        startNewGame(fromUserId, BOT_ID);
+        return;
+      }
+
       if (toUser && toUser.socketId && fromUser) {
         logEvent('game', `Invitation sent: ${fromUser.username} -> ${toUser.username}`);
         io.to(toUser.socketId).emit('invitation', { fromUser: { id: fromUser.id, username: fromUser.username } });
       }
     });
 
+    function startNewGame(p1Id: string, p2Id: string) {
+      const gameId = Math.random().toString(36).substr(2, 9);
+      const game = {
+        id: gameId,
+        players: [p1Id, p2Id],
+        board: Array(9).fill(null),
+        turn: p1Id,
+        status: 'playing' as const,
+        startTime: Date.now(),
+        round: 1,
+        scores: { [p1Id]: 0, [p2Id]: 0 },
+        rematchRequests: []
+      };
+      games.set(gameId, game);
+
+      const u1 = users.get(p1Id);
+      const u2 = users.get(p2Id);
+      if (u1) u1.status = 'ingame';
+      if (u2) u2.status = 'ingame';
+
+      logEvent('game', `Game started: ${gameId} (${u1?.username} vs ${u2?.username})`);
+      
+      if (u1?.socketId) io.to(u1.socketId).emit('gameStarted', game);
+      if (u2?.socketId) io.to(u2.socketId).emit('gameStarted', game);
+      broadcastUsers();
+    }
+
     socket.on('respondInvitation', ({ fromUserId, toUserId, accept }) => {
       const fromUser = users.get(fromUserId);
       const toUser = users.get(toUserId);
 
       if (accept) {
-        const gameId = Math.random().toString(36).substr(2, 9);
-        const game = {
-          id: gameId,
-          players: [fromUserId, toUserId],
-          board: Array(9).fill(null),
-          turn: fromUserId,
-          status: 'playing' as const,
-          startTime: Date.now(),
-          round: 1,
-          scores: { [fromUserId]: 0, [toUserId]: 0 },
-          rematchRequests: []
-        };
-        games.set(gameId, game);
-
-        if (fromUser) fromUser.status = 'ingame';
-        if (toUser) toUser.status = 'ingame';
-
-        logEvent('game', `Game started: ${gameId} (${fromUser?.username} vs ${toUser?.username})`);
-        
-        if (fromUser?.socketId) io.to(fromUser.socketId).emit('gameStarted', game);
-        if (toUser?.socketId) io.to(toUser.socketId).emit('gameStarted', game);
-        broadcastUsers();
+        startNewGame(fromUserId, toUserId);
       } else {
         logEvent('game', `Invitation rejected: ${fromUser?.username} <- ${toUser?.username}`);
         if (fromUser?.socketId) {
@@ -172,7 +244,11 @@ async function startServer() {
 
       if (!game.rematchRequests.includes(userId)) {
         game.rematchRequests.push(userId);
-        logEvent('game', `Rematch requested by ${userId} for game ${gameId}`);
+      }
+
+      const hasBot = game.players.includes(BOT_ID);
+      if (hasBot && !game.rematchRequests.includes(BOT_ID)) {
+        game.rematchRequests.push(BOT_ID);
       }
 
       if (game.rematchRequests.length === 2 && game.round < 3 && !game.seriesWinner) {
@@ -181,33 +257,45 @@ async function startServer() {
         game.status = 'playing';
         game.winner = undefined;
         game.rematchRequests = [];
-        game.turn = game.players[game.round % 2 === 0 ? 1 : 0]; // Alternating first turn
+        game.turn = game.players[game.round % 2 === 0 ? 1 : 0];
         
-        logEvent('game', `Rematch accepted: Round ${game.round} starts for ${gameId}`);
         broadcastGameUpdate(gameId);
+        
+        if (game.turn === BOT_ID) {
+          setTimeout(() => botMove(gameId), 1000);
+        }
       } else {
         broadcastGameUpdate(gameId);
       }
     });
 
-    socket.on('makeMove', ({ gameId, userId, index }) => {
+    async function botMove(gameId: string) {
+      const game = games.get(gameId);
+      if (!game || game.status !== 'playing' || game.turn !== BOT_ID) return;
+
+      // Simple AI: Random empty spot
+      const emptyIndices = game.board.map((cell, i) => cell === null ? i : null).filter(v => v !== null) as number[];
+      if (emptyIndices.length > 0) {
+        const randomIndex = emptyIndices[Math.floor(Math.random() * emptyIndices.length)];
+        processMove(gameId, BOT_ID, randomIndex);
+      }
+    }
+
+    function processMove(gameId: string, userId: string, index: number) {
       const game = games.get(gameId);
       const user = users.get(userId);
       if (!game || game.status !== 'playing' || game.turn !== userId || game.board[index] !== null) return;
 
       const symbol = game.players[0] === userId ? 'X' : 'O';
       game.board[index] = symbol;
-      logEvent('game', `Move made: ${gameId} - ${user?.username} placed ${symbol} at index ${index}`);
 
-      const winner = checkWinner(game.board);
-      if (winner) {
+      const winnerSymbol = checkWinner(game.board);
+      if (winnerSymbol) {
         game.status = 'won';
         game.winner = userId;
         game.scores[userId] += 1;
         
-        // Series check
         if (game.scores[userId] >= 2 || (game.round === 3)) {
-          // Determine series winner based on scores
           const opponentId = game.players.find(p => p !== userId)!;
           if (game.scores[userId] > game.scores[opponentId]) {
             game.seriesWinner = userId;
@@ -217,38 +305,46 @@ async function startServer() {
           
           if (game.seriesWinner) {
             const seriesWinnerUser = users.get(game.seriesWinner);
+            const seriesLoserUser = users.get(game.players.find(p => p !== game.seriesWinner)!);
             if (seriesWinnerUser) seriesWinnerUser.wins += 1;
-            logEvent('game', `Series ended: ${gameId} - Champion: ${seriesWinnerUser?.username}`);
+            if (seriesLoserUser) seriesLoserUser.losses += 1;
           }
-        }
-
-        logEvent('game', `Round ${game.round} won by ${user?.username}. Score: ${JSON.stringify(game.scores)}`);
-        
-        // If series is over, end game (set users back to online)
-        if (game.seriesWinner || game.round === 3) {
           endGame(gameId);
         }
       } else if (game.board.every(cell => cell !== null)) {
         game.status = 'draw';
-        logEvent('game', `Round ${game.round} ended in Draw.`);
-        
         if (game.round === 3) {
           const p1 = game.players[0];
           const p2 = game.players[1];
+          const u1 = users.get(p1);
+          const u2 = users.get(p2);
           if (game.scores[p1] > game.scores[p2]) game.seriesWinner = p1;
           else if (game.scores[p2] > game.scores[p1]) game.seriesWinner = p2;
           
           if (game.seriesWinner) {
-            const seriesWinnerUser = users.get(game.seriesWinner);
-            if (seriesWinnerUser) seriesWinnerUser.wins += 1;
+            const winU = users.get(game.seriesWinner);
+            const loseU = users.get(game.players.find(p => p !== game.seriesWinner)!);
+            if (winU) winU.wins += 1;
+            if (loseU) loseU.losses += 1;
+          } else {
+            // Overall series draw
+            if (u1) u1.draws += 1;
+            if (u2) u2.draws += 1;
           }
           endGame(gameId);
         }
       } else {
         game.turn = game.players.find(p => p !== userId)!;
+        if (game.turn === BOT_ID) {
+          setTimeout(() => botMove(gameId), 1000);
+        }
       }
 
       broadcastGameUpdate(gameId);
+    }
+
+    socket.on('makeMove', ({ gameId, userId, index }) => {
+      processMove(gameId, userId, index);
     });
 
     socket.on('leaveGame', ({ gameId, userId }) => {
@@ -261,8 +357,9 @@ async function startServer() {
         game.winner = winnerId;
         game.seriesWinner = winnerId;
         if (winner) winner.wins += 1;
+        if (user) user.losses += 1;
         
-        logEvent('game', `Game ended: ${gameId} - ${user?.username} abandoned. Winner: ${winner?.username}`);
+        logEvent('game', `Game ended: ${gameId} - Abandoned by ${user?.username}`);
         endGame(gameId);
         broadcastGameUpdate(gameId);
       }
@@ -270,29 +367,35 @@ async function startServer() {
 
     socket.on('disconnect', () => {
       const user = Array.from(users.values()).find(u => u.socketId === socket.id);
-      if (user) {
-        user.status = 'offline';
-        logEvent('system', `User disconnected: ${user.username}`);
+      if (user && user.id !== BOT_ID) {
+        logEvent('system', `User disconnected: ${user.username}. Waiting for reconnection...`);
         
-        const gameEntry = Array.from(games.entries()).find(([id, g]) => g.status === 'playing' && g.players.includes(user.id));
-        if (gameEntry) {
-          const [gameId, game] = gameEntry;
-          const winnerId = game.players.find(p => p !== user.id)!;
-          const winner = users.get(winnerId);
-          game.status = 'won';
-          game.winner = winnerId;
-          game.seriesWinner = winnerId;
-          if (winner) winner.wins += 1;
-          logEvent('game', `Game ended by disconnection: ${gameId} - Winner: ${winner?.username}`);
-          endGame(gameId);
-          broadcastGameUpdate(gameId);
-        }
-        broadcastUsers();
+        const timeout = setTimeout(() => {
+          user.status = 'offline';
+          const gameEntry = Array.from(games.entries()).find(([id, g]) => g.status === 'playing' && g.players.includes(user.id));
+          if (gameEntry) {
+            const [gameId, game] = gameEntry;
+            const winnerId = game.players.find(p => p !== user.id)!;
+            const winner = users.get(winnerId);
+            game.status = 'won';
+            game.winner = winnerId;
+            game.seriesWinner = winnerId;
+            if (winner) winner.wins += 1;
+            user.losses += 1;
+            endGame(gameId);
+            broadcastGameUpdate(gameId);
+          }
+          broadcastUsers();
+          reconnectionTimeouts.delete(user.id);
+        }, 30000); // 30 second window
+
+        reconnectionTimeouts.set(user.id, timeout);
       }
     });
 
     function broadcastUsers() {
-      io.emit('userList', Array.from(users.values()).map(({ id, username, status, wins }) => ({ id, username, status, wins })));
+      const userList = Array.from(users.values()).map(({ id, username, status, wins, draws, losses, isBot }) => ({ id, username, status, wins, draws, losses, isBot }));
+      io.emit('userList', userList);
     }
 
     function broadcastGameUpdate(gameId: string) {
@@ -310,7 +413,7 @@ async function startServer() {
       if (game) {
         game.players.forEach(pid => {
           const u = users.get(pid);
-          if (u) u.status = 'online';
+          if (u && u.id !== BOT_ID) u.status = 'online';
         });
         broadcastUsers();
       }

@@ -3,6 +3,18 @@ export interface User {
   username: string;
   status: 'online' | 'offline' | 'ingame';
   wins: number;
+  draws: number;
+  losses: number;
+  isBot?: boolean;
+}
+
+export interface ServerStats {
+  connectedUsers: number;
+  activeGames: number;
+  totalGames: number;
+  totalUsers: number;
+  errors: number;
+  uptimeSeconds: number;
 }
 
 export interface Game {

@@ -16,14 +16,35 @@ export default function App() {
   const [invitation, setInvitation] = useState<{ fromUser: { id: string, username: string } } | null>(null);
   const [notification, setNotification] = useState<{ type: 'success' | 'error', message: string } | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [serverStats, setServerStats] = useState<any>(null);
 
   useEffect(() => {
+    const savedUserId = localStorage.getItem('ttt_userId');
+    const savedUsername = localStorage.getItem('ttt_username');
+    if (savedUserId && savedUsername) {
+      setUserId(savedUserId);
+      setUsername(savedUsername);
+      setAuthStatus('authenticated');
+    }
+
     const socket = getSocket();
     
     setIsConnected(socket.connected);
 
-    socket.on('connect', () => setIsConnected(true));
+    socket.on('connect', () => {
+      setIsConnected(true);
+      // Attempt re-join if we have a userId
+      const savedUserId = localStorage.getItem('ttt_userId');
+      if (savedUserId) {
+        socket.emit('rejoin', { userId: savedUserId });
+      }
+    });
+
     socket.on('disconnect', () => setIsConnected(false));
+
+    socket.on('serverStats', (stats) => {
+      setServerStats(stats);
+    });
 
     socket.on('userList', (updatedUsers: User[]) => {
       setUsers(updatedUsers);
@@ -73,6 +94,8 @@ export default function App() {
     setUserId(uId);
     setUsername(uName);
     setAuthStatus('authenticated');
+    localStorage.setItem('ttt_userId', uId);
+    localStorage.setItem('ttt_username', uName);
     getSocket().emit('join', { id: uId, username: uName, status: 'online', wins: 0 });
     getSocket().emit('getUsers');
   };
@@ -81,6 +104,8 @@ export default function App() {
     setUserId(null);
     setUsername(null);
     setAuthStatus('unauthenticated');
+    localStorage.removeItem('ttt_userId');
+    localStorage.removeItem('ttt_username');
     setGame(null);
   };
 
@@ -125,8 +150,15 @@ export default function App() {
                 Copiar Link
               </button>
               <div className="text-right hidden sm:block">
-                <p className="text-sm font-bold text-slate-200">{username}</p>
-                <p className="text-[10px] text-slate-400 uppercase tracking-widest leading-none">Senior Player</p>
+                <p className="text-sm font-bold text-slate-200">
+                  {username}
+                  {username?.toLowerCase() === 'admin' && (
+                    <span className="ml-2 text-[8px] bg-rose-500/20 text-rose-400 px-1.5 py-0.5 rounded uppercase tracking-widest border border-rose-500/30 align-text-top">Admin</span>
+                  )}
+                </p>
+                <p className="text-[10px] text-slate-400 uppercase tracking-widest leading-none">
+                  {username?.toLowerCase() === 'admin' ? 'System Administrator' : 'Senior Player'}
+                </p>
               </div>
               <div className="flex items-center gap-2">
                 <div className="w-10 h-10 rounded-full bg-slate-700 border border-white/10 overflow-hidden flex items-center justify-center bg-gradient-to-br from-indigo-500 to-purple-600 text-white font-bold text-xs uppercase">
@@ -220,7 +252,12 @@ export default function App() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -20 }}
             >
-              <Lobby users={users} currentUserId={userId!} onInvite={handleInvite} />
+              <Lobby 
+                users={users} 
+                currentUserId={userId!} 
+                onInvite={handleInvite} 
+                serverStats={serverStats} 
+              />
             </motion.div>
           )}
         </AnimatePresence>
