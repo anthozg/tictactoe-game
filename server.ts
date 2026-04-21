@@ -4,6 +4,7 @@ import { Server } from 'socket.io';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import bcrypt from 'bcryptjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,33 +21,100 @@ async function startServer() {
 
   const PORT = 3000;
 
-  // In-memory data store
-  const users = new Map<string, { id: string, username: string, status: 'online' | 'offline' | 'ingame', socketId?: string, wins: number }>();
-  const games = new Map<string, { id: string, players: string[], board: (string | null)[], turn: string, status: 'playing' | 'draw' | 'won', winner?: string }>();
+  // In-memory data store with Requirement 1 in mind (structure for persistence)
+  const users = new Map<string, { 
+    id: string, 
+    username: string, 
+    email?: string, // Support for new email field
+    hashedPassword: string, 
+    status: 'online' | 'offline' | 'ingame', 
+    socketId?: string, 
+    wins: number 
+  }>();
+  
+  const games = new Map<string, { 
+    id: string, 
+    players: string[], 
+    board: (string | null)[], 
+    turn: string, 
+    status: 'playing' | 'draw' | 'won', 
+    winner?: string,
+    startTime: number,
+    round: number,
+    scores: Record<string, number>,
+    rematchRequests: string[],
+    seriesWinner?: string
+  }>();
+
+  // Requirement 9: Monitor and Log Server Events
+  function logEvent(type: string, message: string, data?: any) {
+    const timestamp = new Date().toISOString();
+    const logEntry = `[${timestamp}] [${type.toUpperCase()}] ${message}`;
+    console.log(logEntry, data ? JSON.stringify(data) : '');
+    // In a real production app, this would be written to a DB or log file.
+  }
 
   io.on('connection', (socket) => {
-    console.log('User connected:', socket.id);
+    logEvent('system', `Socket connected: ${socket.id}`);
 
-    socket.on('register', ({ username, password }, callback) => {
-      // Basic simulation of registration
-      if (Array.from(users.values()).some(u => u.username === username)) {
-        return callback({ success: false, message: 'Username already taken' });
+    socket.on('register', async ({ username, email, password }, callback) => {
+      try {
+        if (Array.from(users.values()).some(u => u.username === username)) {
+          logEvent('auth', `Registration failed: Username '${username}' exists`);
+          return callback({ success: false, message: 'Nombre de usuario ya registrado' });
+        }
+
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(password, salt);
+        
+        const userId = Math.random().toString(36).substr(2, 9);
+        users.set(userId, { 
+          id: userId, 
+          username, 
+          email,
+          hashedPassword, 
+          status: 'online', 
+          socketId: socket.id, 
+          wins: 0 
+        });
+
+        logEvent('auth', `User registered: ${username} (${userId})`);
+        callback({ success: true, userId });
+        broadcastUsers();
+      } catch (err) {
+        logEvent('error', 'Registration error', err);
+        callback({ success: false, message: 'Error interno en el registro' });
       }
-      const userId = Math.random().toString(36).substr(2, 9);
-      users.set(userId, { id: userId, username, status: 'online', socketId: socket.id, wins: 0 });
-      callback({ success: true, userId });
-      broadcastUsers();
     });
 
-    socket.on('login', ({ username, password }, callback) => {
-      const user = Array.from(users.values()).find(u => u.username === username);
+    socket.on('resetPassword', ({ email }, callback) => {
+      const user = Array.from(users.values()).find(u => u.email === email);
       if (user) {
-        user.status = 'online';
-        user.socketId = socket.id;
-        callback({ success: true, userId: user.id });
-        broadcastUsers();
+        logEvent('auth', `Password recovery requested for: ${email} (${user.username})`);
+        callback({ success: true, message: 'Instrucciones enviadas' });
       } else {
-        callback({ success: false, message: 'Invalid credentials' });
+        logEvent('auth', `Password recovery failed: Email '${email}' not found`);
+        callback({ success: false, message: 'Correo no registrado' });
+      }
+    });
+
+    socket.on('login', async ({ username, password }, callback) => {
+      try {
+        const user = Array.from(users.values()).find(u => u.username === username);
+        
+        if (user && await bcrypt.compare(password, user.hashedPassword)) {
+          user.status = 'online';
+          user.socketId = socket.id;
+          logEvent('auth', `Login success: ${username}`);
+          callback({ success: true, userId: user.id });
+          broadcastUsers();
+        } else {
+          logEvent('auth', `Login failed: Invalid credentials for '${username}'`);
+          callback({ success: false, message: 'Credenciales inválidas' });
+        }
+      } catch (err) {
+        logEvent('error', 'Login error', err);
+        callback({ success: false, message: 'Error en la autenticación' });
       }
     });
 
@@ -58,11 +126,15 @@ async function startServer() {
       const toUser = users.get(toUserId);
       const fromUser = users.get(fromUserId);
       if (toUser && toUser.socketId && fromUser) {
+        logEvent('game', `Invitation sent: ${fromUser.username} -> ${toUser.username}`);
         io.to(toUser.socketId).emit('invitation', { fromUser: { id: fromUser.id, username: fromUser.username } });
       }
     });
 
     socket.on('respondInvitation', ({ fromUserId, toUserId, accept }) => {
+      const fromUser = users.get(fromUserId);
+      const toUser = users.get(toUserId);
+
       if (accept) {
         const gameId = Math.random().toString(36).substr(2, 9);
         const game = {
@@ -70,43 +142,108 @@ async function startServer() {
           players: [fromUserId, toUserId],
           board: Array(9).fill(null),
           turn: fromUserId,
-          status: 'playing' as const
+          status: 'playing' as const,
+          startTime: Date.now(),
+          round: 1,
+          scores: { [fromUserId]: 0, [toUserId]: 0 },
+          rematchRequests: []
         };
         games.set(gameId, game);
 
-        const u1 = users.get(fromUserId);
-        const u2 = users.get(toUserId);
-        if (u1) u1.status = 'ingame';
-        if (u2) u2.status = 'ingame';
+        if (fromUser) fromUser.status = 'ingame';
+        if (toUser) toUser.status = 'ingame';
 
-        if (u1?.socketId) io.to(u1.socketId).emit('gameStarted', game);
-        if (u2?.socketId) io.to(u2.socketId).emit('gameStarted', game);
+        logEvent('game', `Game started: ${gameId} (${fromUser?.username} vs ${toUser?.username})`);
+        
+        if (fromUser?.socketId) io.to(fromUser.socketId).emit('gameStarted', game);
+        if (toUser?.socketId) io.to(toUser.socketId).emit('gameStarted', game);
         broadcastUsers();
       } else {
-        const fromUser = users.get(fromUserId);
+        logEvent('game', `Invitation rejected: ${fromUser?.username} <- ${toUser?.username}`);
         if (fromUser?.socketId) {
           io.to(fromUser.socketId).emit('invitationRejected', { by: toUserId });
         }
       }
     });
 
+    socket.on('requestRematch', ({ gameId, userId }) => {
+      const game = games.get(gameId);
+      if (!game || game.status === 'playing') return;
+
+      if (!game.rematchRequests.includes(userId)) {
+        game.rematchRequests.push(userId);
+        logEvent('game', `Rematch requested by ${userId} for game ${gameId}`);
+      }
+
+      if (game.rematchRequests.length === 2 && game.round < 3 && !game.seriesWinner) {
+        game.round += 1;
+        game.board = Array(9).fill(null);
+        game.status = 'playing';
+        game.winner = undefined;
+        game.rematchRequests = [];
+        game.turn = game.players[game.round % 2 === 0 ? 1 : 0]; // Alternating first turn
+        
+        logEvent('game', `Rematch accepted: Round ${game.round} starts for ${gameId}`);
+        broadcastGameUpdate(gameId);
+      } else {
+        broadcastGameUpdate(gameId);
+      }
+    });
+
     socket.on('makeMove', ({ gameId, userId, index }) => {
       const game = games.get(gameId);
+      const user = users.get(userId);
       if (!game || game.status !== 'playing' || game.turn !== userId || game.board[index] !== null) return;
 
       const symbol = game.players[0] === userId ? 'X' : 'O';
       game.board[index] = symbol;
+      logEvent('game', `Move made: ${gameId} - ${user?.username} placed ${symbol} at index ${index}`);
 
       const winner = checkWinner(game.board);
       if (winner) {
         game.status = 'won';
         game.winner = userId;
-        const user = users.get(userId);
-        if (user) user.wins += 1;
-        endGame(gameId);
+        game.scores[userId] += 1;
+        
+        // Series check
+        if (game.scores[userId] >= 2 || (game.round === 3)) {
+          // Determine series winner based on scores
+          const opponentId = game.players.find(p => p !== userId)!;
+          if (game.scores[userId] > game.scores[opponentId]) {
+            game.seriesWinner = userId;
+          } else if (game.scores[opponentId] > game.scores[userId]) {
+            game.seriesWinner = opponentId;
+          }
+          
+          if (game.seriesWinner) {
+            const seriesWinnerUser = users.get(game.seriesWinner);
+            if (seriesWinnerUser) seriesWinnerUser.wins += 1;
+            logEvent('game', `Series ended: ${gameId} - Champion: ${seriesWinnerUser?.username}`);
+          }
+        }
+
+        logEvent('game', `Round ${game.round} won by ${user?.username}. Score: ${JSON.stringify(game.scores)}`);
+        
+        // If series is over, end game (set users back to online)
+        if (game.seriesWinner || game.round === 3) {
+          endGame(gameId);
+        }
       } else if (game.board.every(cell => cell !== null)) {
         game.status = 'draw';
-        endGame(gameId);
+        logEvent('game', `Round ${game.round} ended in Draw.`);
+        
+        if (game.round === 3) {
+          const p1 = game.players[0];
+          const p2 = game.players[1];
+          if (game.scores[p1] > game.scores[p2]) game.seriesWinner = p1;
+          else if (game.scores[p2] > game.scores[p1]) game.seriesWinner = p2;
+          
+          if (game.seriesWinner) {
+            const seriesWinnerUser = users.get(game.seriesWinner);
+            if (seriesWinnerUser) seriesWinnerUser.wins += 1;
+          }
+          endGame(gameId);
+        }
       } else {
         game.turn = game.players.find(p => p !== userId)!;
       }
@@ -116,12 +253,16 @@ async function startServer() {
 
     socket.on('leaveGame', ({ gameId, userId }) => {
       const game = games.get(gameId);
+      const user = users.get(userId);
       if (game && game.status === 'playing') {
         const winnerId = game.players.find(p => p !== userId)!;
+        const winner = users.get(winnerId);
         game.status = 'won';
         game.winner = winnerId;
-        const winner = users.get(winnerId);
+        game.seriesWinner = winnerId;
         if (winner) winner.wins += 1;
+        
+        logEvent('game', `Game ended: ${gameId} - ${user?.username} abandoned. Winner: ${winner?.username}`);
         endGame(gameId);
         broadcastGameUpdate(gameId);
       }
@@ -131,15 +272,18 @@ async function startServer() {
       const user = Array.from(users.values()).find(u => u.socketId === socket.id);
       if (user) {
         user.status = 'offline';
-        // Handle if they were in a game
+        logEvent('system', `User disconnected: ${user.username}`);
+        
         const gameEntry = Array.from(games.entries()).find(([id, g]) => g.status === 'playing' && g.players.includes(user.id));
         if (gameEntry) {
           const [gameId, game] = gameEntry;
           const winnerId = game.players.find(p => p !== user.id)!;
+          const winner = users.get(winnerId);
           game.status = 'won';
           game.winner = winnerId;
-          const winner = users.get(winnerId);
+          game.seriesWinner = winnerId;
           if (winner) winner.wins += 1;
+          logEvent('game', `Game ended by disconnection: ${gameId} - Winner: ${winner?.username}`);
           endGame(gameId);
           broadcastGameUpdate(gameId);
         }
@@ -204,7 +348,7 @@ async function startServer() {
   }
 
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    logEvent('system', `Server operational at http://0.0.0.0:${PORT}`);
   });
 }
 

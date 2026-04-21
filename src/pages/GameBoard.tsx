@@ -1,8 +1,8 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { Game } from '../types';
 import { getSocket } from '../lib/socket';
 import { motion, AnimatePresence } from 'motion/react';
-import { Swords, X, Circle, RotateCcw, LogOut, Trophy, AlertCircle } from 'lucide-react';
+import { LogOut, Trophy, AlertCircle } from 'lucide-react';
 
 interface GameBoardProps {
   game: Game;
@@ -11,43 +11,86 @@ interface GameBoardProps {
 }
 
 export default function GameBoard({ game, userId, onBack }: GameBoardProps) {
+  const [seconds, setSeconds] = useState(0);
+
   const isMyTurn = game.status === 'playing' && game.turn === userId;
   const isWinner = game.status === 'won' && game.winner === userId;
   const isLoser = game.status === 'won' && game.winner !== userId;
-  const isDraw = game.status === 'draw';
+
+  const hasRequestedRematch = game.rematchRequests.includes(userId);
+  const canRequestRematch = game.status !== 'playing' && !game.seriesWinner && game.round < 3;
+
+  // Timer logic
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (game.status === 'playing') {
+      interval = setInterval(() => {
+        setSeconds(s => s + 1);
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [game.status, game.round]); // Reset timer display per round if desired, or keep total
+
+  const formatTime = (totalSeconds: number) => {
+    const mins = Math.floor(totalSeconds / 60);
+    const secs = totalSeconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
 
   const handleCellClick = (index: number) => {
     if (!isMyTurn || game.board[index] !== null) return;
     getSocket().emit('makeMove', { gameId: game.id, userId, index });
   };
 
+  const handleRematch = () => {
+    getSocket().emit('requestRematch', { gameId: game.id, userId });
+  };
+
   const handleLeave = () => {
-    if (game.status === 'playing') {
-      if (confirm('¿Seguro que quieres abandonar? Se contará como una derrota.')) {
+    const msg = game.status === 'playing' 
+      ? '¿Seguro que quieres abandonar? Se contará como una derrota total.'
+      : '¿Salir al lobby?';
+    if (confirm(msg)) {
+      if (game.status === 'playing') {
         getSocket().emit('leaveGame', { gameId: game.id, userId });
+      } else {
+        onBack();
       }
-    } else {
-      onBack();
     }
   };
+
+  const opponentId = game.players.find(p => p !== userId)!;
+  const myScore = game.scores[userId] || 0;
+  const opponentScore = game.scores[opponentId] || 0;
 
   return (
     <div className="max-w-5xl mx-auto py-4 h-full flex flex-col">
       {/* Game Header */}
       <div className="glass-panel rounded-2xl p-4 flex items-center justify-between mb-8 bg-white/5">
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-6">
           <div className="flex items-center gap-3">
-            <span className="text-blue-500 font-black text-xl italic neon-text-blue">X</span>
+            <div className="flex flex-col items-center">
+              <span className="text-blue-400 font-black text-2xl italic neon-text-blue leading-none">X</span>
+              <span className="text-[10px] font-black text-blue-500/50 mt-1">{myScore} WINS</span>
+            </div>
             <span className="text-sm font-bold text-slate-200">
               {game.players[0] === userId ? 'Tú' : 'Rival'}
             </span>
           </div>
-          <span className="text-slate-600 font-black italic text-xs">VS</span>
+          
+          <div className="flex flex-col items-center px-4 border-x border-white/5">
+            <span className="text-slate-600 font-black italic text-[10px] tracking-widest uppercase">Ronda</span>
+            <span className="text-xl font-black text-indigo-400 italic font-mono">{game.round}/3</span>
+          </div>
+
           <div className="flex items-center gap-3">
             <span className="text-sm font-bold text-slate-200">
               {game.players[1] === userId ? 'Tú' : 'Rival'}
             </span>
-            <span className="text-rose-500 font-black text-xl italic neon-text-rose">O</span>
+            <div className="flex flex-col items-center">
+              <span className="text-rose-400 font-black text-2xl italic neon-text-rose leading-none">O</span>
+              <span className="text-[10px] font-black text-rose-500/50 mt-1">{opponentScore} WINS</span>
+            </div>
           </div>
         </div>
 
@@ -79,25 +122,29 @@ export default function GameBoard({ game, userId, onBack }: GameBoardProps) {
                 whileHover={isMyTurn && !cell ? { scale: 1.02 } : {}}
                 whileTap={isMyTurn && !cell ? { scale: 0.98 } : {}}
                 onClick={() => handleCellClick(idx)}
-                className={`board-cell rounded-2xl flex items-center justify-center transition-all ${
+                className={`board-cell rounded-2xl flex items-center justify-center transition-all aspect-square w-full h-full min-w-0 min-h-0 ${
                   !cell && isMyTurn ? 'cursor-pointer' : 'cursor-default'
                 }`}
               >
-                <AnimatePresence>
+                <AnimatePresence mode="wait">
                   {cell === 'X' && (
                     <motion.div
+                      key="X"
                       initial={{ scale: 0, opacity: 0 }}
                       animate={{ scale: 1, opacity: 1 }}
-                      className="text-blue-500 font-black text-6xl sm:text-7xl neon-text-blue"
+                      exit={{ scale: 0, opacity: 0 }}
+                      className="text-blue-500 font-black text-6xl sm:text-7xl neon-text-blue flex items-center justify-center w-full h-full"
                     >
                       X
                     </motion.div>
                   )}
                   {cell === 'O' && (
                     <motion.div
+                      key="O"
                       initial={{ scale: 0, opacity: 0 }}
                       animate={{ scale: 1, opacity: 1 }}
-                      className="text-rose-500 font-black text-6xl sm:text-7xl neon-text-rose"
+                      exit={{ scale: 0, opacity: 0 }}
+                      className="text-rose-500 font-black text-6xl sm:text-7xl neon-text-rose flex items-center justify-center w-full h-full"
                     >
                       O
                     </motion.div>
@@ -116,10 +163,14 @@ export default function GameBoard({ game, userId, onBack }: GameBoardProps) {
                 key="result"
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
-                className="glass-panel rounded-3xl p-8 shadow-2xl border-indigo-500/30"
+                className="glass-panel rounded-3xl p-8 shadow-2xl border-indigo-500/30 overflow-hidden relative"
               >
+                {game.seriesWinner === userId && (
+                  <div className="absolute inset-0 bg-indigo-600/5 pointer-events-none animate-pulse" />
+                )}
+                
                 <div className="flex justify-center mb-6">
-                  {isWinner ? (
+                  {(game.seriesWinner === userId || isWinner) ? (
                     <div className="w-16 h-16 bg-indigo-600/20 rounded-2xl flex items-center justify-center border border-indigo-500/40 shadow-[0_0_20px_rgba(99,102,241,0.2)]">
                       <Trophy className="w-8 h-8 text-indigo-400" />
                     </div>
@@ -131,20 +182,40 @@ export default function GameBoard({ game, userId, onBack }: GameBoardProps) {
                 </div>
 
                 <h3 className="text-2xl font-black text-center mb-1 uppercase tracking-tighter italic">
-                  {isWinner ? 'Dominación' : isLoser ? 'Eliminado' : 'Empate'}
+                  {game.seriesWinner === userId ? 'Campeón Final' : 
+                   game.seriesWinner && game.seriesWinner !== userId ? 'Derrota Total' :
+                   isWinner ? 'Dominación' : game.status === 'won' ? 'Eliminado' : 'Empate'}
                 </h3>
-                <p className="text-center text-[10px] text-slate-500 font-black uppercase tracking-widest mb-8">
-                  {isWinner ? 'Análisis completado: Victoria' : 
-                   isLoser ? 'Error en ejecución: Derrota' : 
+                <p className="text-center text-[10px] text-slate-500 font-black uppercase tracking-widest mb-8 leading-tight">
+                  {game.seriesWinner === userId ? 'Has conquistado la ronda de 3 vueltas' :
+                   game.seriesWinner ? 'El oponente ha dominado la serie' :
+                   isWinner ? `Ronda ${game.round} ganada. ¡Siguiente!` : 
+                   game.status === 'won' ? 'Error en ejecución: Derrota' : 
                    'Conflicto de señales: Empate'}
                 </p>
 
-                <button
-                  onClick={onBack}
-                  className="w-full py-4 bg-indigo-600 text-white font-black uppercase tracking-[0.2em] text-[10px] rounded-xl hover:bg-indigo-500 transition-all shadow-lg shadow-indigo-600/20"
-                >
-                  VOLVER AL LOBBY
-                </button>
+                <div className="space-y-3">
+                  {canRequestRematch ? (
+                    <button
+                      onClick={handleRematch}
+                      disabled={hasRequestedRematch}
+                      className={`w-full py-4 text-white font-black uppercase tracking-[0.2em] text-[10px] rounded-xl transition-all shadow-lg ${
+                        hasRequestedRematch 
+                          ? 'bg-slate-800 text-slate-500 cursor-default' 
+                          : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/20'
+                      }`}
+                    >
+                      {hasRequestedRematch ? 'ESPERANDO RIVAL...' : 'SOLICITAR REVANCHA'}
+                    </button>
+                  ) : null}
+                  
+                  <button
+                    onClick={onBack}
+                    className="w-full py-4 bg-slate-800/50 text-slate-400 font-black uppercase tracking-[0.2em] text-[10px] rounded-xl hover:bg-slate-800 transition-all border border-white/5"
+                  >
+                    VOLVER AL LOBBY
+                  </button>
+                </div>
               </motion.div>
             ) : (
               <motion.div
@@ -178,13 +249,15 @@ export default function GameBoard({ game, userId, onBack }: GameBoardProps) {
 
           <div className="glass-panel rounded-2xl p-4 flex justify-between items-center bg-slate-900/50">
             <div className="text-center flex-1">
-              <p className="text-[9px] font-black text-slate-500 uppercase tracking-widest">Duelos</p>
-              <p className="text-sm font-black italic">04</p>
+              <p className="text-[9px] font-black text-slate-500 uppercase tracking-widest">Estado</p>
+              <p className="text-sm font-black italic uppercase text-indigo-400 tracking-tighter">
+                {game.status === 'playing' ? `Duelo activo` : 'Ronda Pausada'}
+              </p>
             </div>
             <div className="w-px h-6 bg-white/5" />
             <div className="text-center flex-1">
               <p className="text-[9px] font-black text-slate-500 uppercase tracking-widest">Uptime</p>
-              <p className="text-sm font-mono font-bold">01:24</p>
+              <p className="text-sm font-mono font-bold tracking-wider">{formatTime(seconds)}</p>
             </div>
           </div>
         </div>

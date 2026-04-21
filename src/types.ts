@@ -12,6 +12,10 @@ export interface Game {
   turn: string;
   status: 'playing' | 'draw' | 'won';
   winner?: string;
+  round: number;
+  scores: Record<string, number>;
+  rematchRequests: string[];
+  seriesWinner?: string;
 }
 
 export type AuthStatus = 'unauthenticated' | 'authenticating' | 'authenticated';
